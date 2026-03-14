@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+logs/
+output/
+output_docker/
+telegram_output/
+test_botfactory_leads.xlsx
+test_email_preview.html
+botfactory_leads.xlsx
+leads.xlsx
+data/

@@ -1,0 +1,57 @@
+services:
+  - type: web
+    name: botfactory-lead-machine
+    runtime: python
+    plan: free
+    branch: main
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn render_web_service:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180
+    healthCheckPath: /healthz
+    envVars:
+      - key: SCRAPE_SEED_URL
+        sync: false
+      - key: GMAIL_EMAIL
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: GEMINI_ENABLED
+        value: true
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite-preview
+      - key: GOOGLE_SHEETS_ENABLED
+        value: true
+      - key: GOOGLE_SHEETS_SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_SHEETS_WORKSHEET
+        value: Leads
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON_B64
+        sync: false
+      - key: LEADS_FILE
+        value: data/botfactory_leads_backup.xlsx
+      - key: TEMPLATE_FILE
+        value: template.html
+      - key: OUTREACH_LANGUAGE
+        value: uz
+      - key: FILTER_PRIORITY_CATEGORIES
+        value: true
+      - key: VALIDATE_EMAIL_MX
+        value: true
+      - key: LOGS_DIR
+        value: logs
+      - key: EMAIL_MAX_PER_RUN
+        value: 10
+      - key: WARM_UP_MODE
+        value: true
+      - key: REPLY_SYNC_ENABLED
+        value: true
+      - key: RENDER_TRIGGER_TOKEN
+        sync: false
+      - key: RENDER_ENABLE_SCHEDULER
+        value: false
+      - key: RENDER_SCHEDULE_CRON
+        value: 0 6 * * *
+      - key: RENDER_TIMEZONE
+        value: Asia/Tashkent
