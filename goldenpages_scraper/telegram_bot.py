@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import pandas as pd
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -19,6 +20,8 @@ from telegram.ext import (
     filters,
 )
 
+from .phone_leads import build_sms_leads_dataframe, export_sms_leads, parse_sms_mobile_prefixes
+from .phone_leads import build_google_contacts_dataframe, export_google_contacts_csv
 from .scraper import GoldenPagesScraper, ScraperSettings
 from .utils import (
     collapse_whitespace,
@@ -41,6 +44,8 @@ class BotConfig:
     max_delay: float
     retries: int
     timeout: float
+    sms_mobile_prefixes: tuple[str, ...]
+    google_contacts_labels: str
 
 
 @dataclass(slots=True)
@@ -49,6 +54,15 @@ class ScrapeRequest:
     chat_id: int
     max_companies: int | None = None
     max_pages_per_seed: int | None = None
+    result_mode: str = "scrape"
+
+
+@dataclass(slots=True)
+class SmsExportSummary:
+    total_rows: int
+    csv_path: Path
+    xlsx_path: Path
+    google_contacts_csv_path: Path
 
 
 class TelegramStatusConsole:
@@ -149,6 +163,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=float(os.getenv("TELEGRAM_SCRAPER_TIMEOUT", "25")),
         help="HTTP timeout in seconds.",
     )
+    parser.add_argument(
+        "--sms-mobile-prefixes",
+        default=os.getenv("TELEGRAM_SMS_MOBILE_PREFIXES", "33,50,90,91,93,94,95,97,98,99"),
+        help="Comma-separated Uzbekistan mobile prefixes that should be treated as SMS-capable.",
+    )
+    parser.add_argument(
+        "--google-contacts-labels",
+        default=os.getenv("TELEGRAM_GOOGLE_CONTACTS_LABELS", "Botfactory SMS Leads:::GoldenPages"),
+        help="Google Contacts labels for the SMS phonebook CSV. Multiple labels can be joined with :::",
+    )
     return parser
 
 
@@ -173,6 +197,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_delay=args.max_delay,
         retries=args.retries,
         timeout=args.timeout,
+        sms_mobile_prefixes=parse_sms_mobile_prefixes(args.sms_mobile_prefixes),
+        google_contacts_labels=collapse_whitespace(args.google_contacts_labels),
     )
 
     application = (
@@ -188,6 +214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("demo", demo_command))
     application.add_handler(CommandHandler("scrape", scrape_command))
+    application.add_handler(CommandHandler("sms", sms_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text_handler))
 
     application.run_polling()
@@ -197,7 +224,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 async def _post_init(application: Application) -> None:
     application.bot_data["active_jobs"] = {}
     application.bot_data["scrape_lock"] = asyncio.Lock()
-    application.bot_data["pending_scrape_requests"] = set()
+    application.bot_data["pending_requests"] = {}
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -226,7 +253,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
 
     if chat_id in active_jobs:
-        await update.effective_message.reply_text("Sizning scraping job'ingiz hozir ishlayapti.")
+        await update.effective_message.reply_text("Sizning aktiv scraping yoki SMS lead job'ingiz hozir ishlayapti.")
         return
 
     scrape_lock: asyncio.Lock = context.application.bot_data["scrape_lock"]
@@ -255,8 +282,8 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if not context.args:
-        pending_scrape_requests: set[int] = context.application.bot_data["pending_scrape_requests"]
-        pending_scrape_requests.add(update.effective_chat.id)
+        pending_requests: dict[int, str] = context.application.bot_data["pending_requests"]
+        pending_requests[update.effective_chat.id] = "scrape"
         await update.effective_message.reply_text(
             "GoldenPages URL yuboring.\n"
             "Masalan:\n"
@@ -270,6 +297,7 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     request, error_message = _parse_scrape_request(
         tokens=context.args,
         chat_id=update.effective_chat.id,
+        result_mode="scrape",
     )
     if error_message:
         await update.effective_message.reply_text(error_message)
@@ -278,16 +306,47 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _enqueue_scrape(update, context, request=request, label="manual")
 
 
+async def sms_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _is_authorized(update, context):
+        return
+
+    if not context.args:
+        pending_requests: dict[int, str] = context.application.bot_data["pending_requests"]
+        pending_requests[update.effective_chat.id] = "sms"
+        await update.effective_message.reply_text(
+            "GoldenPages URL yuboring.\n"
+            "Men faqat SMS yozish mumkin bo'lgan mobil raqamlarni ajratib CSV va XLSX qilib yuboraman.\n\n"
+            "Masalan:\n"
+            "https://www.goldenpages.uz/uz/rubrics/?Id=4676\n\n"
+            "Yoki bitta xabarda shunday yuboring:\n"
+            "/sms https://www.goldenpages.uz/uz/rubrics/?Id=4676 50 2",
+            disable_web_page_preview=True,
+        )
+        return
+
+    request, error_message = _parse_scrape_request(
+        tokens=context.args,
+        chat_id=update.effective_chat.id,
+        result_mode="sms",
+    )
+    if error_message:
+        await update.effective_message.reply_text(error_message)
+        return
+
+    await _enqueue_scrape(update, context, request=request, label="sms")
+
+
 async def plain_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _is_authorized(update, context):
         return
 
-    pending_scrape_requests: set[int] = context.application.bot_data["pending_scrape_requests"]
+    pending_requests: dict[int, str] = context.application.bot_data["pending_requests"]
     chat_id = update.effective_chat.id
     text = collapse_whitespace(update.effective_message.text)
+    request_mode = pending_requests.get(chat_id, "scrape")
 
     if "goldenpages.uz" not in text:
-        if chat_id in pending_scrape_requests:
+        if chat_id in pending_requests:
             await update.effective_message.reply_text(
                 "URL topilmadi. GoldenPages link yuboring.\n"
                 "Masalan:\n"
@@ -299,6 +358,7 @@ async def plain_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     request, error_message = _parse_scrape_request(
         tokens=text.split(),
         chat_id=chat_id,
+        result_mode=request_mode,
     )
     if error_message:
         await update.effective_message.reply_text(
@@ -307,8 +367,8 @@ async def plain_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    pending_scrape_requests.discard(chat_id)
-    await _enqueue_scrape(update, context, request=request, label="text")
+    pending_requests.pop(chat_id, None)
+    await _enqueue_scrape(update, context, request=request, label=request_mode)
 
 
 async def _enqueue_scrape(
@@ -320,7 +380,7 @@ async def _enqueue_scrape(
 ) -> None:
     active_jobs: dict[int, asyncio.Task[None]] = context.application.bot_data["active_jobs"]
     scrape_lock: asyncio.Lock = context.application.bot_data["scrape_lock"]
-    pending_scrape_requests: set[int] = context.application.bot_data["pending_scrape_requests"]
+    pending_requests: dict[int, str] = context.application.bot_data["pending_requests"]
     chat_id = request.chat_id
 
     if chat_id in active_jobs:
@@ -334,14 +394,22 @@ async def _enqueue_scrape(
         return
 
     await update.effective_message.reply_text(
-        "Scrape boshlandi.\n"
-        f"Turi: {label}\n"
-        f"URL: {request.seed_url}\n"
-        "Jarayon tugagach CSV va XLSX fayllarni shu yerga yuboraman.",
+        (
+            "SMS lead yig'ish boshlandi.\n"
+            if request.result_mode == "sms"
+            else "Scrape boshlandi.\n"
+        )
+        + f"Turi: {label}\n"
+        + f"URL: {request.seed_url}\n"
+        + (
+            "Jarayon tugagach faqat SMS yozish mumkin bo'lgan mobil raqamlar CSV va XLSX ko'rinishida yuboriladi."
+            if request.result_mode == "sms"
+            else "Jarayon tugagach CSV va XLSX fayllarni shu yerga yuboraman."
+        ),
         disable_web_page_preview=True,
     )
 
-    pending_scrape_requests.discard(chat_id)
+    pending_requests.pop(chat_id, None)
     task = asyncio.create_task(_run_scrape_job(context.application, request))
     active_jobs[chat_id] = task
 
@@ -356,31 +424,76 @@ async def _run_scrape_job(application: Application, request: ScrapeRequest) -> N
             console = TelegramStatusConsole(application, request.chat_id)
             summary = await asyncio.to_thread(_execute_scrape, request, config, console)
 
-            await application.bot.send_message(
-                chat_id=request.chat_id,
-                text=(
-                    "Scrape tugadi.\n"
-                    f"Kompaniyalar: {summary.discovered_companies}\n"
-                    f"Export qatorlari: {summary.exported_rows}\n"
-                    f"Xatolar: {summary.failed_count}"
-                ),
-            )
-
-            with summary.csv_path.open("rb") as csv_file:
-                await application.bot.send_document(
+            if request.result_mode == "sms":
+                sms_summary = await asyncio.to_thread(_build_sms_export_from_summary, summary, config)
+                await application.bot.send_message(
                     chat_id=request.chat_id,
-                    document=csv_file,
-                    filename=summary.csv_path.name,
-                    caption="Backup CSV",
+                    text=(
+                        "SMS lead yig'ish tugadi.\n"
+                        f"Kompaniyalar: {summary.discovered_companies}\n"
+                        f"SMS yozish mumkin bo'lgan raqamlar: {sms_summary.total_rows}\n"
+                        f"Xatolar: {summary.failed_count}"
+                    ),
                 )
 
-            with summary.xlsx_path.open("rb") as xlsx_file:
-                await application.bot.send_document(
+                with sms_summary.csv_path.open("rb") as csv_file:
+                    await application.bot.send_document(
+                        chat_id=request.chat_id,
+                        document=csv_file,
+                        filename=sms_summary.csv_path.name,
+                        caption="SMS yozish mumkin bo'lgan raqamlar CSV",
+                    )
+
+                with sms_summary.xlsx_path.open("rb") as xlsx_file:
+                    await application.bot.send_document(
+                        chat_id=request.chat_id,
+                        document=xlsx_file,
+                        filename=sms_summary.xlsx_path.name,
+                        caption="SMS yozish mumkin bo'lgan raqamlar XLSX",
+                    )
+
+                with sms_summary.google_contacts_csv_path.open("rb") as contacts_csv_file:
+                    await application.bot.send_document(
+                        chat_id=request.chat_id,
+                        document=contacts_csv_file,
+                        filename=sms_summary.google_contacts_csv_path.name,
+                        caption="Google Contacts import CSV",
+                    )
+
+                await application.bot.send_message(
                     chat_id=request.chat_id,
-                    document=xlsx_file,
-                    filename=summary.xlsx_path.name,
-                    caption="Excel natija",
+                    text=(
+                        "Google Contacts CSV ni contacts.google.com ichidan 'Import qilish' orqali yuklasangiz, "
+                        "kontaktlar telefoningizga ham sinxron tushadi."
+                    ),
+                    disable_web_page_preview=True,
                 )
+            else:
+                await application.bot.send_message(
+                    chat_id=request.chat_id,
+                    text=(
+                        "Scrape tugadi.\n"
+                        f"Kompaniyalar: {summary.discovered_companies}\n"
+                        f"Export qatorlari: {summary.exported_rows}\n"
+                        f"Xatolar: {summary.failed_count}"
+                    ),
+                )
+
+                with summary.csv_path.open("rb") as csv_file:
+                    await application.bot.send_document(
+                        chat_id=request.chat_id,
+                        document=csv_file,
+                        filename=summary.csv_path.name,
+                        caption="Backup CSV",
+                    )
+
+                with summary.xlsx_path.open("rb") as xlsx_file:
+                    await application.bot.send_document(
+                        chat_id=request.chat_id,
+                        document=xlsx_file,
+                        filename=summary.xlsx_path.name,
+                        caption="Excel natija",
+                    )
 
             if summary.failed_count:
                 with summary.state_path.open("rb") as state_file:
@@ -422,17 +535,48 @@ def _execute_scrape(
     return scraper.run()
 
 
+def _build_sms_export_from_summary(summary, config: BotConfig) -> SmsExportSummary:
+    dataframe = pd.read_excel(summary.xlsx_path)
+    sms_dataframe = build_sms_leads_dataframe(
+        dataframe,
+        mobile_prefixes=config.sms_mobile_prefixes,
+    )
+    google_contacts_dataframe = build_google_contacts_dataframe(
+        sms_dataframe,
+        labels=config.google_contacts_labels,
+    )
+    run_id = summary.csv_path.stem.removeprefix("backup_data_")
+    sms_csv_path, sms_xlsx_path = export_sms_leads(
+        sms_dataframe,
+        summary.csv_path.parent,
+        run_id,
+    )
+    google_contacts_csv_path = export_google_contacts_csv(
+        google_contacts_dataframe,
+        summary.csv_path.parent,
+        run_id,
+    )
+    return SmsExportSummary(
+        total_rows=len(sms_dataframe.index),
+        csv_path=sms_csv_path,
+        xlsx_path=sms_xlsx_path,
+        google_contacts_csv_path=google_contacts_csv_path,
+    )
+
+
 def _parse_scrape_request(
     *,
     tokens: Sequence[str],
     chat_id: int,
+    result_mode: str,
 ) -> tuple[ScrapeRequest | None, str | None]:
     if not tokens:
+        command_name = "/sms" if result_mode == "sms" else "/scrape"
         return None, (
             "Format:\n"
-            "/scrape <goldenpages_url> [max_companies] [max_pages_per_seed]\n"
+            f"{command_name} <goldenpages_url> [max_companies] [max_pages_per_seed]\n"
             "Misol:\n"
-            "/scrape https://www.goldenpages.uz/uz/rubrics/?Id=4676 50 3"
+            f"{command_name} https://www.goldenpages.uz/uz/rubrics/?Id=4676 50 3"
         )
 
     seed_url = normalize_url(tokens[0])
@@ -452,6 +596,7 @@ def _parse_scrape_request(
             chat_id=chat_id,
             max_companies=max_companies,
             max_pages_per_seed=max_pages_per_seed,
+            result_mode=result_mode,
         ),
         None,
     )
@@ -500,14 +645,17 @@ def _help_text() -> str:
         "GoldenPages Telegram Bot tayyor.\n\n"
         "Buyruqlar:\n"
         "/scrape <url> [max_companies] [max_pages_per_seed]\n"
+        "/sms <url> [max_companies] [max_pages_per_seed]\n"
         "/demo\n"
         "/status\n"
         "/help\n\n"
         "Misollar:\n"
         "/scrape https://www.goldenpages.uz/uz/rubrics/?Id=4676\n"
         "/scrape https://www.goldenpages.uz/uz/rubrics/?Id=4676 50 2\n"
+        "/sms https://www.goldenpages.uz/uz/rubrics/?Id=4676 50 2\n"
         "/demo\n\n"
-        "Natija tugagach bot sizga CSV va XLSX fayl yuboradi."
+        "Natija tugagach bot sizga CSV va XLSX fayl yuboradi.\n"
+        "/sms komandasi esa faqat SMS yozish mumkin bo'lgan mobil raqamlarni ajratib beradi."
     )
 
 

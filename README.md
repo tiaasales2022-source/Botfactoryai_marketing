@@ -111,8 +111,15 @@ Telegram bot usage:
 ```text
 /scrape https://www.goldenpages.uz/uz/rubrics/?Id=4676
 /scrape https://www.goldenpages.uz/uz/rubrics/?Id=4676 50 2
+/sms https://www.goldenpages.uz/uz/rubrics/?Id=4676 50 2
 /demo
 ```
+
+`/sms` komandasi uchta fayl yuboradi:
+
+- oddiy SMS lead `CSV`
+- oddiy SMS lead `XLSX`
+- `Google Contacts` import uchun tayyor `CSV`
 
 Optional bot access control:
 
