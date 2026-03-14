@@ -11,10 +11,22 @@ services:
     envVars:
       - key: SCRAPE_SEED_URL
         sync: false
+      - key: EMAIL_TRANSPORT
+        value: brevo
+      - key: EMAIL_SENDER_EMAIL
+        sync: false
+      - key: EMAIL_REPLY_TO
+        sync: false
       - key: GMAIL_EMAIL
         sync: false
       - key: GMAIL_APP_PASSWORD
         sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: BREVO_API_URL
+        value: https://api.brevo.com/v3/smtp/email
+      - key: BREVO_SANDBOX_MODE
+        value: false
       - key: GEMINI_ENABLED
         value: true
       - key: GEMINI_API_KEY

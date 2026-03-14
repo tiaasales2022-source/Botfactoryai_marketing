@@ -135,6 +135,13 @@ Send outreach from pending leads:
 python main.py --mode email
 ```
 
+Recommended for Render free:
+
+- set `EMAIL_TRANSPORT=brevo`
+- set `BREVO_API_KEY=...`
+- set `EMAIL_SENDER_EMAIL=verified_sender@example.com`
+- keep `EMAIL_REPLY_TO` / `GMAIL_EMAIL` for replies and IMAP sync
+
 Run the full scrape + outreach pipeline:
 
 ```bash
@@ -179,7 +186,16 @@ Google Sheets can be used as the primary lead storage by setting:
 Notes:
 
 - free Render web services can sleep when idle, so built-in scheduling is not fully reliable on free
-- free Render instances may block SMTP ports, so Gmail SMTP may require a paid instance or an API-based email provider
+- free Render instances block SMTP ports, so `EMAIL_TRANSPORT=brevo` is the recommended production path on free
+
+Brevo API setup for Render free:
+
+- `EMAIL_TRANSPORT=brevo`
+- `BREVO_API_KEY=<your-brevo-api-key>`
+- `EMAIL_SENDER_EMAIL=<verified-sender-email>`
+- `EMAIL_FROM_NAME=Botfactory AI`
+- `EMAIL_REPLY_TO=<gmail-or-support-email>`
+- optional: `BREVO_SANDBOX_MODE=true` for safe testing without actual delivery
 
 ## Output
 

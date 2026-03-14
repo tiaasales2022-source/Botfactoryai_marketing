@@ -20,6 +20,7 @@ from typing import Any, Sequence
 from urllib.parse import quote
 
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 from jinja2 import BaseLoader, Environment, select_autoescape
 from rich.console import Console
@@ -202,13 +203,19 @@ DEFAULT_HTML_TEMPLATE = """\
 
 @dataclass(slots=True)
 class SMTPConfig:
+    transport: str
     host: str
     port: int
     username: str
     password: str
+    sender_email: str
     from_name: str
     reply_to: str
     retry_limit: int
+    api_key: str
+    api_url: str
+    request_timeout_seconds: float
+    sandbox_mode: bool
 
 
 @dataclass(slots=True)
@@ -379,6 +386,10 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     gemini_api_key = normalize_secret(getenv_str("GEMINI_API_KEY", ""))
     gemini_model = getenv_str("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
     google_sheets_enabled = getenv_bool("GOOGLE_SHEETS_ENABLED", False)
+    preferred_email_transport = normalize_email_transport(getenv_str("EMAIL_TRANSPORT", "auto"))
+    brevo_api_key = normalize_secret(getenv_str("BREVO_API_KEY", ""))
+    email_transport = resolve_email_transport(preferred_email_transport, brevo_api_key)
+    sender_email = getenv_str("EMAIL_SENDER_EMAIL", getenv_str("GMAIL_EMAIL", ""))
 
     if args.mode in {"scrape", "all"} and not seed_url:
         raise ValueError("SCRAPE_SEED_URL is missing. Set it in .env or pass --seed-url.")
@@ -388,13 +399,19 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         raise ValueError("EMAIL_MAX_PER_RUN must be at least 1.")
 
     smtp = SMTPConfig(
+        transport=email_transport,
         host=getenv_str("SMTP_HOST", "smtp.gmail.com"),
         port=getenv_int("SMTP_PORT", 465),
         username=getenv_str("GMAIL_EMAIL"),
         password=normalize_secret(getenv_str("GMAIL_APP_PASSWORD")),
+        sender_email=sender_email,
         from_name=getenv_str("EMAIL_FROM_NAME", "Botfactory AI"),
         reply_to=getenv_str("EMAIL_REPLY_TO", getenv_str("GMAIL_EMAIL")),
         retry_limit=getenv_int("SMTP_RETRY_LIMIT", 3),
+        api_key=brevo_api_key,
+        api_url=getenv_str("BREVO_API_URL", "https://api.brevo.com/v3/smtp/email"),
+        request_timeout_seconds=getenv_float("EMAIL_REQUEST_TIMEOUT_SECONDS", 30.0),
+        sandbox_mode=getenv_bool("BREVO_SANDBOX_MODE", False),
     )
     brand_name = getenv_str("BOTFACTORY_BRAND_NAME", "Botfactory AI")
     brand = BrandConfig(
@@ -476,6 +493,29 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         smtp=smtp,
         brand=brand,
     )
+
+
+def normalize_email_transport(value: str) -> str:
+    normalized = collapse_whitespace(value).casefold()
+    if normalized in {"", "auto"}:
+        return "auto"
+    if normalized in {"brevo", "brevo-api", "brevo_api"}:
+        return "brevo"
+    if normalized in {"smtp", "gmail"}:
+        return "smtp"
+    raise ValueError("EMAIL_TRANSPORT must be one of: auto, brevo, smtp.")
+
+
+def resolve_email_transport(preferred: str, brevo_api_key: str) -> str:
+    if preferred == "auto":
+        return "brevo" if brevo_api_key else "smtp"
+    return preferred
+
+
+def email_transport_label(config: SMTPConfig) -> str:
+    if config.transport == "brevo":
+        return "Brevo API"
+    return f"SMTP ({config.host}:{config.port})"
 
 
 LANGUAGE_LABELS: dict[str, dict[str, str]] = {
@@ -739,6 +779,7 @@ async def main_async(config: AppConfig, console: Console) -> None:
             f"MX validation: {'on' if config.validate_email_mx else 'off'}\n"
             f"Warm-up mode: {'on' if config.warm_up_mode else 'off'}\n"
             f"Reply sync: {'on' if config.reply_sync_enabled else 'off'}\n"
+            f"Email transport: {email_transport_label(config.smtp)}\n"
             f"Storage: {'Google Sheets + Excel backup' if config.sheets else 'Excel'}",
             title="Botfactory Lead Machine",
             border_style="cyan",
@@ -940,10 +981,15 @@ async def run_email_phase(config: AppConfig, console: Console) -> SendPhaseResul
                 leads_df.at[row_index, "Sent At"] = now_iso
                 leads_df.at[row_index, "Last Error"] = ""
                 sent_now += 1
+                console.print(f"[green]Sent[/green] {row['Email']} via {email_transport_label(config.smtp)}")
             else:
                 leads_df.at[row_index, "Status"] = "Error"
                 leads_df.at[row_index, "Last Error"] = truncate_error(error_message)
                 failed_now += 1
+                console.print(
+                    f"[red]Failed[/red] {row['Email']} via {email_transport_label(config.smtp)}: "
+                    f"{truncate_error(error_message, limit=160)}"
+                )
 
             save_leads_dataframe(leads_df, config.leads_file, config.sheets)
             progress.advance(task_id)
@@ -1364,13 +1410,36 @@ def is_usable_email_validation(validation_status: str) -> bool:
 
 def validate_email_config(config: AppConfig) -> None:
     missing = []
-    if not config.smtp.username:
-        missing.append("GMAIL_EMAIL")
-    if not config.smtp.password:
-        missing.append("GMAIL_APP_PASSWORD")
+    if config.smtp.transport == "brevo":
+        if not config.smtp.api_key:
+            missing.append("BREVO_API_KEY")
+        if not config.smtp.sender_email:
+            missing.append("EMAIL_SENDER_EMAIL")
+    else:
+        if not config.smtp.username:
+            missing.append("GMAIL_EMAIL")
+        if not config.smtp.password:
+            missing.append("GMAIL_APP_PASSWORD")
     if missing:
         raise ValueError(f"Missing required email settings: {', '.join(missing)}")
-    if config.smtp.host.casefold() == "smtp.gmail.com" and len(config.smtp.password) != 16:
+    if (
+        config.reply_sync_enabled
+        and (not config.smtp.username or not config.smtp.password)
+    ):
+        raise ValueError("Reply sync requires GMAIL_EMAIL and GMAIL_APP_PASSWORD for IMAP access.")
+    if (
+        config.reply_sync_enabled
+        and config.imap_host.casefold() == "imap.gmail.com"
+        and len(config.smtp.password) != 16
+    ):
+        raise ValueError(
+            "Reply sync with Gmail IMAP requires GMAIL_APP_PASSWORD to be a 16-character Gmail App Password."
+        )
+    if (
+        config.smtp.transport == "smtp"
+        and config.smtp.host.casefold() == "smtp.gmail.com"
+        and len(config.smtp.password) != 16
+    ):
         raise ValueError(
             "GMAIL_APP_PASSWORD must be a 16-character Gmail App Password. "
             "Enable Google 2-Step Verification, create an App Password, and paste it into .env."
@@ -1751,6 +1820,14 @@ def generate_ai_outreach(
     return text or None
 
 
+def contact_email_for_outreach(config: AppConfig) -> str:
+    return (
+        collapse_whitespace(config.smtp.reply_to)
+        or collapse_whitespace(config.smtp.username)
+        or collapse_whitespace(config.smtp.sender_email)
+    )
+
+
 def compose_outreach_email(config: AppConfig, row: pd.Series, template_text: str) -> EmailDraft:
     company_name = collapse_whitespace(str(row.get("Company Name", ""))) or "hamkor"
     category = collapse_whitespace(str(row.get("Category", ""))) or "General Business"
@@ -1763,6 +1840,7 @@ def compose_outreach_email(config: AppConfig, row: pd.Series, template_text: str
     reply_phrase = reply_phrase_for_language(config, language)
     unsubscribe_text = unsubscribe_text_for_language(config, language)
     custom_offer_text = custom_offer_for_language(config, language)
+    contact_email = contact_email_for_outreach(config)
 
     text_context = {
         "brand_name": config.brand.brand_name,
@@ -1795,7 +1873,7 @@ def compose_outreach_email(config: AppConfig, row: pd.Series, template_text: str
         "meeting_button": labels["meeting_button"],
         "contact_button": labels["contact_button"],
         "cta_prompt": labels["cta_prompt"],
-        "mailto_href": f"mailto:{config.smtp.username}?subject={quote(labels['mailto_subject'])}",
+        "mailto_href": f"mailto:{contact_email}?subject={quote(labels['mailto_subject'])}",
         "rights_text": labels["rights_text"],
         "location_text": labels["location_text"],
         "website_label": labels["website_label"],
@@ -1816,13 +1894,13 @@ def compose_outreach_email(config: AppConfig, row: pd.Series, template_text: str
             else ""
         ),
         "discovery_call_url": config.brand.discovery_call_url,
-        "your_email": config.smtp.username,
+        "your_email": contact_email,
         "signature_name": config.brand.signature_name,
         "signature_role": config.brand.signature_role,
         "signature_company": config.brand.signature_company,
         "signature_phone": config.brand.signature_phone,
         "signature_website": config.brand.signature_website,
-        "sender_email": config.smtp.username,
+        "sender_email": contact_email,
         "unsubscribe_text": unsubscribe_text,
     }
     return EmailDraft(
@@ -1964,8 +2042,17 @@ def send_email_once(
     html_body: str,
     plain_text_body: str,
 ) -> tuple[bool, str]:
+    if smtp_config.transport == "brevo":
+        return send_email_via_brevo(
+            smtp_config=smtp_config,
+            to_email=to_email,
+            subject=subject,
+            html_body=html_body,
+            plain_text_body=plain_text_body,
+        )
+
     message = EmailMessage()
-    message["From"] = formataddr((smtp_config.from_name, smtp_config.username))
+    message["From"] = formataddr((smtp_config.from_name, smtp_config.sender_email or smtp_config.username))
     message["To"] = to_email
     message["Subject"] = subject
     message["Reply-To"] = smtp_config.reply_to or smtp_config.username
@@ -1985,6 +2072,63 @@ def send_email_once(
         return True, ""
     except Exception as exc:
         return False, str(exc)
+
+
+def send_email_via_brevo(
+    smtp_config: SMTPConfig,
+    to_email: str,
+    subject: str,
+    html_body: str,
+    plain_text_body: str,
+) -> tuple[bool, str]:
+    sender_email = smtp_config.sender_email or smtp_config.username
+    if not sender_email:
+        return False, "EMAIL_SENDER_EMAIL is missing."
+
+    payload: dict[str, Any] = {
+        "sender": {
+            "name": smtp_config.from_name,
+            "email": sender_email,
+        },
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_body,
+        "textContent": plain_text_body,
+    }
+    reply_to = collapse_whitespace(smtp_config.reply_to or smtp_config.username)
+    if reply_to:
+        payload["replyTo"] = {
+            "email": reply_to,
+            "name": smtp_config.from_name,
+        }
+
+    headers = {
+        "api-key": smtp_config.api_key,
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+    if smtp_config.sandbox_mode:
+        headers["X-Sib-Sandbox"] = "drop"
+
+    try:
+        response = requests.post(
+            smtp_config.api_url,
+            headers=headers,
+            json=payload,
+            timeout=smtp_config.request_timeout_seconds,
+        )
+    except requests.RequestException as exc:
+        return False, f"Brevo request failed: {exc}"
+
+    if 200 <= response.status_code < 300:
+        return True, ""
+
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = response.text.strip()
+    error_message = collapse_whitespace(str(response_payload))
+    return False, f"Brevo API {response.status_code}: {error_message}"
 
 
 def truncate_error(message: str, limit: int = 240) -> str:

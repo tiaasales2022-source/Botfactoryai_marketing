@@ -196,6 +196,7 @@ def index() -> Any:
             "ok": True,
             "storage": storage_mode,
             "gemini_model": config.gemini_model,
+            "email_transport": botfactory_main.email_transport_label(config.smtp),
             "scheduler_enabled": botfactory_main.getenv_bool("RENDER_ENABLE_SCHEDULER", False),
             "leads": leads,
             "state": _STATE,
@@ -222,6 +223,7 @@ def status() -> Any:
                     "state": _STATE,
                     "storage": "google-sheets" if config.sheets else "excel",
                     "gemini_model": config.gemini_model,
+                    "email_transport": botfactory_main.email_transport_label(config.smtp),
                     "leads": collect_lead_snapshot(config),
                 }
             ),
