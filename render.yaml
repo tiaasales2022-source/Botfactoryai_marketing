@@ -12,7 +12,7 @@ services:
       - key: SCRAPE_SEED_URL
         sync: false
       - key: EMAIL_TRANSPORT
-        value: brevo
+        value: gmail-api
       - key: EMAIL_SENDER_EMAIL
         sync: false
       - key: EMAIL_REPLY_TO
@@ -21,6 +21,16 @@ services:
         sync: false
       - key: GMAIL_APP_PASSWORD
         sync: false
+      - key: GMAIL_API_CLIENT_ID
+        sync: false
+      - key: GMAIL_API_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_API_REFRESH_TOKEN
+        sync: false
+      - key: GMAIL_API_TOKEN_URL
+        value: https://oauth2.googleapis.com/token
+      - key: GMAIL_API_SEND_URL
+        value: https://gmail.googleapis.com/gmail/v1/users/me/messages/send
       - key: BREVO_API_KEY
         sync: false
       - key: BREVO_API_URL

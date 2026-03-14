@@ -62,6 +62,7 @@ EMAIL_RE = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNORECAS
 TEMPLATE_RE = re.compile(r"{{\s*([a-zA-Z0-9_]+)\s*}}")
 _GEMINI_CLIENTS: dict[str, Any] = {}
 _GOOGLE_SHEETS_WORKSHEETS: dict[str, Any] = {}
+_GMAIL_API_TOKENS: dict[str, tuple[str, float]] = {}
 
 HEALTHCARE_KEYWORDS = (
     "klinika",
@@ -216,6 +217,11 @@ class SMTPConfig:
     api_url: str
     request_timeout_seconds: float
     sandbox_mode: bool
+    oauth_client_id: str
+    oauth_client_secret: str
+    oauth_refresh_token: str
+    oauth_token_url: str
+    gmail_api_send_url: str
 
 
 @dataclass(slots=True)
@@ -388,7 +394,15 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     google_sheets_enabled = getenv_bool("GOOGLE_SHEETS_ENABLED", False)
     preferred_email_transport = normalize_email_transport(getenv_str("EMAIL_TRANSPORT", "auto"))
     brevo_api_key = normalize_secret(getenv_str("BREVO_API_KEY", ""))
-    email_transport = resolve_email_transport(preferred_email_transport, brevo_api_key)
+    gmail_api_client_id = normalize_secret(getenv_str("GMAIL_API_CLIENT_ID", ""))
+    gmail_api_client_secret = normalize_secret(getenv_str("GMAIL_API_CLIENT_SECRET", ""))
+    gmail_api_refresh_token = normalize_secret(getenv_str("GMAIL_API_REFRESH_TOKEN", ""))
+    email_transport = resolve_email_transport(
+        preferred_email_transport,
+        brevo_api_key=brevo_api_key,
+        gmail_api_client_id=gmail_api_client_id,
+        gmail_api_refresh_token=gmail_api_refresh_token,
+    )
     sender_email = getenv_str("EMAIL_SENDER_EMAIL", getenv_str("GMAIL_EMAIL", ""))
 
     if args.mode in {"scrape", "all"} and not seed_url:
@@ -412,6 +426,11 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         api_url=getenv_str("BREVO_API_URL", "https://api.brevo.com/v3/smtp/email"),
         request_timeout_seconds=getenv_float("EMAIL_REQUEST_TIMEOUT_SECONDS", 30.0),
         sandbox_mode=getenv_bool("BREVO_SANDBOX_MODE", False),
+        oauth_client_id=gmail_api_client_id,
+        oauth_client_secret=gmail_api_client_secret,
+        oauth_refresh_token=gmail_api_refresh_token,
+        oauth_token_url=getenv_str("GMAIL_API_TOKEN_URL", "https://oauth2.googleapis.com/token"),
+        gmail_api_send_url=getenv_str("GMAIL_API_SEND_URL", "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"),
     )
     brand_name = getenv_str("BOTFACTORY_BRAND_NAME", "Botfactory AI")
     brand = BrandConfig(
@@ -499,20 +518,32 @@ def normalize_email_transport(value: str) -> str:
     normalized = collapse_whitespace(value).casefold()
     if normalized in {"", "auto"}:
         return "auto"
+    if normalized in {"gmail-api", "gmail_api", "gmailapi"}:
+        return "gmail-api"
     if normalized in {"brevo", "brevo-api", "brevo_api"}:
         return "brevo"
     if normalized in {"smtp", "gmail"}:
         return "smtp"
-    raise ValueError("EMAIL_TRANSPORT must be one of: auto, brevo, smtp.")
+    raise ValueError("EMAIL_TRANSPORT must be one of: auto, gmail-api, brevo, smtp.")
 
 
-def resolve_email_transport(preferred: str, brevo_api_key: str) -> str:
+def resolve_email_transport(
+    preferred: str,
+    *,
+    brevo_api_key: str,
+    gmail_api_client_id: str,
+    gmail_api_refresh_token: str,
+) -> str:
     if preferred == "auto":
+        if gmail_api_client_id and gmail_api_refresh_token:
+            return "gmail-api"
         return "brevo" if brevo_api_key else "smtp"
     return preferred
 
 
 def email_transport_label(config: SMTPConfig) -> str:
+    if config.transport == "gmail-api":
+        return "Gmail API"
     if config.transport == "brevo":
         return "Brevo API"
     return f"SMTP ({config.host}:{config.port})"
@@ -1410,7 +1441,16 @@ def is_usable_email_validation(validation_status: str) -> bool:
 
 def validate_email_config(config: AppConfig) -> None:
     missing = []
-    if config.smtp.transport == "brevo":
+    if config.smtp.transport == "gmail-api":
+        if not config.smtp.username:
+            missing.append("GMAIL_EMAIL")
+        if not config.smtp.oauth_client_id:
+            missing.append("GMAIL_API_CLIENT_ID")
+        if not config.smtp.oauth_client_secret:
+            missing.append("GMAIL_API_CLIENT_SECRET")
+        if not config.smtp.oauth_refresh_token:
+            missing.append("GMAIL_API_REFRESH_TOKEN")
+    elif config.smtp.transport == "brevo":
         if not config.smtp.api_key:
             missing.append("BREVO_API_KEY")
         if not config.smtp.sender_email:
@@ -2042,6 +2082,14 @@ def send_email_once(
     html_body: str,
     plain_text_body: str,
 ) -> tuple[bool, str]:
+    if smtp_config.transport == "gmail-api":
+        return send_email_via_gmail_api(
+            smtp_config=smtp_config,
+            to_email=to_email,
+            subject=subject,
+            html_body=html_body,
+            plain_text_body=plain_text_body,
+        )
     if smtp_config.transport == "brevo":
         return send_email_via_brevo(
             smtp_config=smtp_config,
@@ -2072,6 +2120,92 @@ def send_email_once(
         return True, ""
     except Exception as exc:
         return False, str(exc)
+
+
+def get_gmail_api_access_token(smtp_config: SMTPConfig) -> tuple[str | None, str]:
+    cache_key = smtp_config.oauth_refresh_token
+    cached = _GMAIL_API_TOKENS.get(cache_key)
+    if cached is not None:
+        access_token, expires_at = cached
+        if time.time() < expires_at - 60:
+            return access_token, ""
+
+    payload = {
+        "client_id": smtp_config.oauth_client_id,
+        "client_secret": smtp_config.oauth_client_secret,
+        "refresh_token": smtp_config.oauth_refresh_token,
+        "grant_type": "refresh_token",
+    }
+    try:
+        response = requests.post(
+            smtp_config.oauth_token_url,
+            data=payload,
+            timeout=smtp_config.request_timeout_seconds,
+        )
+    except requests.RequestException as exc:
+        return None, f"Gmail API token request failed: {exc}"
+
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = {}
+
+    if response.status_code != 200:
+        return None, f"Gmail API token error {response.status_code}: {collapse_whitespace(str(response_payload))}"
+
+    access_token = collapse_whitespace(str(response_payload.get("access_token", "")))
+    expires_in = int(response_payload.get("expires_in", 3600) or 3600)
+    if not access_token:
+        return None, "Gmail API token response did not include access_token."
+    _GMAIL_API_TOKENS[cache_key] = (access_token, time.time() + expires_in)
+    return access_token, ""
+
+
+def send_email_via_gmail_api(
+    smtp_config: SMTPConfig,
+    to_email: str,
+    subject: str,
+    html_body: str,
+    plain_text_body: str,
+) -> tuple[bool, str]:
+    access_token, token_error = get_gmail_api_access_token(smtp_config)
+    if not access_token:
+        return False, token_error
+
+    sender_email = smtp_config.sender_email or smtp_config.username
+    message = EmailMessage()
+    message["From"] = formataddr((smtp_config.from_name, sender_email))
+    message["To"] = to_email
+    message["Subject"] = subject
+    message["Reply-To"] = smtp_config.reply_to or smtp_config.username
+    message.set_content(plain_text_body)
+    message.add_alternative(html_body, subtype="html")
+
+    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"raw": raw_message}
+
+    try:
+        response = requests.post(
+            smtp_config.gmail_api_send_url,
+            headers=headers,
+            json=payload,
+            timeout=smtp_config.request_timeout_seconds,
+        )
+    except requests.RequestException as exc:
+        return False, f"Gmail API send failed: {exc}"
+
+    if 200 <= response.status_code < 300:
+        return True, ""
+
+    try:
+        response_payload = response.json()
+    except ValueError:
+        response_payload = response.text.strip()
+    return False, f"Gmail API {response.status_code}: {collapse_whitespace(str(response_payload))}"
 
 
 def send_email_via_brevo(

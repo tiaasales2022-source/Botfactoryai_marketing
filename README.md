@@ -137,9 +137,11 @@ python main.py --mode email
 
 Recommended for Render free:
 
-- set `EMAIL_TRANSPORT=brevo`
-- set `BREVO_API_KEY=...`
-- set `EMAIL_SENDER_EMAIL=verified_sender@example.com`
+- set `EMAIL_TRANSPORT=gmail-api`
+- set `GMAIL_API_CLIENT_ID=...`
+- set `GMAIL_API_CLIENT_SECRET=...`
+- set `GMAIL_API_REFRESH_TOKEN=...`
+- set `EMAIL_SENDER_EMAIL=<your-gmail-address>`
 - keep `EMAIL_REPLY_TO` / `GMAIL_EMAIL` for replies and IMAP sync
 
 Run the full scrape + outreach pipeline:
@@ -186,16 +188,28 @@ Google Sheets can be used as the primary lead storage by setting:
 Notes:
 
 - free Render web services can sleep when idle, so built-in scheduling is not fully reliable on free
-- free Render instances block SMTP ports, so `EMAIL_TRANSPORT=brevo` is the recommended production path on free
+- free Render instances block SMTP ports, so `EMAIL_TRANSPORT=gmail-api` is the recommended production path on free
+- `gmail_oauth_setup.py` helps generate a Gmail API refresh token locally
 
-Brevo API setup for Render free:
+Gmail API setup for Render free:
 
-- `EMAIL_TRANSPORT=brevo`
-- `BREVO_API_KEY=<your-brevo-api-key>`
-- `EMAIL_SENDER_EMAIL=<verified-sender-email>`
-- `EMAIL_FROM_NAME=Botfactory AI`
-- `EMAIL_REPLY_TO=<gmail-or-support-email>`
-- optional: `BREVO_SANDBOX_MODE=true` for safe testing without actual delivery
+1. Create a Google Cloud OAuth Desktop client.
+2. Set `GMAIL_API_CLIENT_ID` and `GMAIL_API_CLIENT_SECRET` locally.
+3. Run:
+
+```bash
+python gmail_oauth_setup.py
+```
+
+4. Copy the printed `GMAIL_API_REFRESH_TOKEN` into Render.
+5. Set:
+
+- `EMAIL_TRANSPORT=gmail-api`
+- `GMAIL_EMAIL=<your-gmail-address>`
+- `EMAIL_SENDER_EMAIL=<your-gmail-address>`
+- `GMAIL_API_CLIENT_ID=<client-id>`
+- `GMAIL_API_CLIENT_SECRET=<client-secret>`
+- `GMAIL_API_REFRESH_TOKEN=<refresh-token>`
 
 ## Output
 

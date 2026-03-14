@@ -84,7 +84,7 @@ Vazifasi:
 - Gemini orqali AI personalizatsiya yaratish
 - HTML va plain-text email tayyorlash
 - retry va exponential backoff bilan yuborish
-- transportni avtomatik tanlash: SMTP yoki Brevo API
+- transportni avtomatik tanlash: Gmail API, Brevo API yoki SMTP
 
 AI personalization:
 
@@ -212,8 +212,8 @@ Lead ustunlari:
 7. AI ishlamasa static copy ishlatiladi.
 8. `template.html` orqali HTML email render qilinadi.
 9. Plain-text fallback yaratiladi.
-10. `EMAIL_TRANSPORT=auto` bo'lsa Brevo API kaliti mavjudligiga qarab Brevo API yoki SMTP tanlanadi.
-11. Render free muhitida tavsiya etilgan kanal: Brevo API.
+10. `EMAIL_TRANSPORT=auto` bo'lsa avval Gmail API, keyin Brevo API, oxirida SMTP tanlanadi.
+11. Render free muhitida tavsiya etilgan kanal: Gmail API.
 12. Status `Sent` yoki `Error` ga yangilanadi.
 13. Warm-up state va JSON loglar yangilanadi.
 
@@ -260,7 +260,7 @@ Lead ustunlari:
 - duplicate lead control
 - email validation
 - Gmail App Password preflight check
-- API transport fallback: Render free muhitida SMTP o'rniga Brevo HTTPS API ishlatish
+- API transport fallback: Render free muhitida SMTP o'rniga Gmail API yoki Brevo HTTPS API ishlatish
 - AI fallback
 - JSON log va checkpoint
 
