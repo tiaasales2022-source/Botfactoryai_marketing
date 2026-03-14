@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import secrets
+import sys
 import threading
 import traceback
 from datetime import datetime
@@ -24,6 +24,7 @@ except Exception:  # pragma: no cover
 
 app = Flask(__name__)
 _RUN_LOCK = threading.Lock()
+_STATE_LOCK = threading.Lock()
 _SCHEDULER: Any | None = None
 _STATE: dict[str, Any] = {
     "status": "idle",
@@ -43,7 +44,33 @@ def now_iso() -> str:
 
 
 def set_state(**updates: Any) -> None:
-    _STATE.update(updates)
+    with _STATE_LOCK:
+        _STATE.update(updates)
+
+
+def append_state_output(text: str, max_chars: int = 12000) -> None:
+    if not text:
+        return
+    with _STATE_LOCK:
+        _STATE["last_output"] = (_STATE.get("last_output", "") + text)[-max_chars:]
+
+
+class StateLogStream:
+    encoding = "utf-8"
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        append_state_output(text)
+        return len(text)
+
+    def flush(self) -> None:
+        sys.stdout.flush()
+
+    def isatty(self) -> bool:
+        return False
 
 
 def authorize_request() -> bool:
@@ -83,8 +110,8 @@ def collect_lead_snapshot(config: botfactory_main.AppConfig) -> dict[str, Any]:
 
 
 def pipeline_worker(mode: str, seed_url: str | None, trigger: str) -> None:
-    buffer = io.StringIO()
-    console = Console(file=buffer, force_terminal=False, color_system=None, width=120)
+    stream = StateLogStream()
+    console = Console(file=stream, force_terminal=False, color_system=None, width=120)
     set_state(
         status="running",
         running=True,
@@ -94,7 +121,9 @@ def pipeline_worker(mode: str, seed_url: str | None, trigger: str) -> None:
         last_seed_url=seed_url or "",
         last_trigger=trigger,
         last_error="",
+        last_output="",
     )
+    print(f"[render_web_service] Pipeline started mode={mode} trigger={trigger} at {now_iso()}", flush=True)
     try:
         config = build_config(mode, seed_url)
         asyncio.run(botfactory_main.main_async(config, console))
@@ -102,16 +131,18 @@ def pipeline_worker(mode: str, seed_url: str | None, trigger: str) -> None:
             status="success",
             running=False,
             last_finished_at=now_iso(),
-            last_output=buffer.getvalue()[-12000:],
         )
+        print(f"[render_web_service] Pipeline finished successfully at {now_iso()}", flush=True)
     except Exception as exc:
+        error_trace = traceback.format_exc()
+        append_state_output("\n" + error_trace)
         set_state(
             status="error",
             running=False,
             last_finished_at=now_iso(),
             last_error=str(exc),
-            last_output=(buffer.getvalue() + "\n" + traceback.format_exc())[-12000:],
         )
+        print(f"[render_web_service] Pipeline failed: {exc}", flush=True)
     finally:
         _RUN_LOCK.release()
 
