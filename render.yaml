@@ -72,7 +72,7 @@ services:
       - key: RENDER_TRIGGER_TOKEN
         sync: false
       - key: RENDER_ENABLE_SCHEDULER
-        value: false
+        value: true
       - key: RENDER_SCHEDULE_CRON
         value: 0 6 * * *
       - key: RENDER_TIMEZONE
